@@ -137,3 +137,12 @@ def load_events(raw_data_dir: Path = RAW_DATA_DIR) -> pd.DataFrame:
 def load_all_datasets(raw_data_dir: Path = RAW_DATA_DIR) -> dict[str, pd.DataFrame]:
     """Load all raw datasets with the shared canonical loaders."""
     return {name: load_dataset(name, raw_data_dir=raw_data_dir) for name in DATASET_FILE_STEMS}
+
+
+def load_all_data():
+    return {
+        "users": load_users(),
+        "sessions": load_sessions(),
+        "transactions": load_transactions(),
+        "events": load_events(),
+    }
