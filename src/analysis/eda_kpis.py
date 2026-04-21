@@ -182,34 +182,24 @@ def plot_retention(retention: DataFrame, figure_path: Path | None = None) -> Pat
     y_lower = max(0.0, y_min - y_padding)
     y_upper = min(1.0, y_max + y_padding)
 
-    fig, ax = plt.subplots(figsize=(9.5, 5.2))
-    colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(retention_for_plot)))
+    fig, ax = plt.subplots(figsize=(8.8, 4.8))
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#8c564b", "#7f7f7f"]
     for color, (install_source, values) in zip(colors, retention_for_plot.iterrows()):
         y_values = values.to_numpy(dtype=float)
         ax.plot(
             x_positions,
             y_values,
             marker="o",
-            linewidth=2.2,
-            markersize=6.5,
+            linewidth=2.6,
+            markersize=7.2,
             color=color,
             markerfacecolor=color,
             markeredgecolor="white",
             markeredgewidth=1.2,
             label=install_source,
+            alpha=0.9 if install_source == "organic" else 0.75,
             zorder=3,
         )
-        for x_value, y_value in zip(x_positions, y_values):
-            ax.annotate(
-                f"{y_value:.1%}",
-                (x_value, y_value),
-                xytext=(0, 8),
-                textcoords="offset points",
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                color=color,
-            )
 
     ax.set_title("Cohort Retention by Install Source")
     ax.set_xlabel("Retention checkpoint")
@@ -219,10 +209,13 @@ def plot_retention(retention: DataFrame, figure_path: Path | None = None) -> Pat
     ax.set_xlim(-0.25, len(checkpoint_labels) - 0.75)
     ax.set_ylim(y_lower, y_upper)
     ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
-    ax.grid(axis="y", alpha=0.3)
-    ax.grid(axis="x", alpha=0.12, linestyle="--")
+    ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.6)
+    ax.grid(axis="x", visible=False)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
+    ax.spines["left"].set_color("#b0b0b0")
+    ax.spines["bottom"].set_color("#b0b0b0")
+    ax.tick_params(axis="both", colors="#444444")
     ax.legend(title="Install source", loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=3, frameon=False)
     fig.tight_layout()
     path = ensure_figure_dir() / (figure_path.name if figure_path else "eda_retention_install_source.png")
