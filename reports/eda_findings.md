@@ -18,10 +18,9 @@
 
 ## 3. Retention patterns by install source
 
-- D1 retention is around 41–43% across install sources.
-- D30 retention is around 20–21% for organic, paid, and cross-promo cohorts.
-- D60 retention settles near 12–13%.
-- Install-source differences are modest, but organic and Google Ads cohorts are slightly stronger through D30.
+- Verified checkpoint retention is tightly clustered across sources: D1 41.6–43.2%, D7 33.3–34.0%, D14 27.7–29.1%, D30 20.6–21.3%, D60 12.3–12.8%.
+- Organic is marginally strongest through D14, while Unity Ads is slightly higher by D30 and D60.
+- Install-source differences are modest overall, so source mix alone does not explain downstream retention variation.
 
 ## 4. Monetization KPIs
 
