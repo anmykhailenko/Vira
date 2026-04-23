@@ -1,37 +1,40 @@
 # Feature Design
 
-## 1. Chosen Grain
+## Final grain choice
 
-Final grain: **one row per `(user_id, game_id)`**.
+Final grain: **one row per `user_id`**.
 
-This is the right entity for segmentation here because the data audit showed that the same `user_id` can appear in multiple games. Using plain `user_id` would collapse distinct install contexts into one row and blur the segmentation target.
+This is the strongest final grain for the first complete version because:
 
-Important modeling constraint:
+- the assignment asks for user-level segmentation by default
+- `sessions.csv`, `transactions.csv`, and `events.csv` only contain `user_id`
+- using `(user_id, game_id)` for the final clustering would duplicate the same behavioral and revenue history across multiple installs for multi-game users
+- `users.csv` is still used to preserve portfolio context through first install attributes and multi-game flags
 
-- `users.csv` contains `game_id`
-- `sessions.csv`, `transactions.csv`, and `events.csv` do not
+The repository previously had an install-level mart. That was useful for exploration, but not for the final segmentation because commercial value and engagement would be overstated for multi-game users.
 
-Because the activity tables do not expose `game_id`, the implemented mart keeps the requested `(user_id, game_id)` grain but computes behavior features at the portfolio `user_id` level, then attaches those user-level summaries to each observed user-game row. This preserves the segmentation entity without inventing unsupported per-game behavior attribution.
-
-## 2. Feature Groups
+## Final feature groups
 
 ### Lifecycle
 
-- `days_since_game_install`
-- `days_since_first_portfolio_install`
+- `days_since_first_install`
+- `days_since_latest_install`
 - `days_since_last_session`
 - `days_since_last_purchase`
-- `install_rank_for_user`
-- `is_first_game_install_flag`
+- `install_span_days`
 
-These separate new installs, mature installs, and lapsed user-game rows.
+These separate new users, mature users, and lapsed users while also capturing whether the player expanded into multiple games over time.
 
-### Portfolio Context
+### Portfolio context
 
+- `primary_game_id`
+- `primary_install_source`
+- `primary_device_os`
+- `primary_country`
 - `games_installed_count`
 - `multi_game_user_flag`
 
-These capture whether a user belongs to a single-game or multi-game portfolio pattern, which is important given the duplicate-user audit finding.
+These are kept compact and interpretable. They add business context without forcing high-cardinality encoding into the final clustering.
 
 ### RFM
 
@@ -39,19 +42,20 @@ These capture whether a user belongs to a single-game or multi-game portfolio pa
 - `rfm_frequency_sessions`
 - `rfm_monetary_total_revenue_usd`
 
-RFM stays compact and interpretable while covering closeness to churn, usage intensity, and commercial value.
+RFM remains the cleanest business shorthand for reactivation risk, engagement frequency, and economic value.
 
-### Engagement
+### Engagement intensity
 
 - `sessions_total`
 - `active_days`
+- `active_days_last_30d`
 - `sessions_per_active_day`
 - `total_session_duration_hours`
 - `avg_session_duration_min`
 
-These describe how often and how deeply a user engages.
+These capture both breadth and depth of play and help separate habitual users from truly low-intensity players.
 
-### Engagement Dynamics
+### Engagement dynamics
 
 - `sessions_last_30d`
 - `sessions_prev_30d`
@@ -61,7 +65,7 @@ These describe how often and how deeply a user engages.
 - `recent_playtime_share_60d`
 - `session_momentum_ratio_30d`
 
-These measure whether behavior is accelerating, stable, or fading without adding too many rolling-window features.
+These distinguish users who are accelerating, stable, or fading.
 
 ### Progression
 
@@ -71,13 +75,14 @@ These measure whether behavior is accelerating, stable, or fading without adding
 - `progression_velocity_levels_per_active_day`
 - `levels_completed_per_session`
 
-These help separate efficient progressors, struggling players, and low-intensity users.
+These reflect progression quality, difficulty friction, and mastery.
 
-### Monetization
+### Monetization behavior
 
 - `payer_flag`
 - `transaction_count`
 - `positive_revenue_transaction_count`
+- `purchase_active_days`
 - `total_revenue_usd`
 - `avg_revenue_per_transaction_usd`
 - `trial_started_flag`
@@ -86,94 +91,73 @@ These help separate efficient progressors, struggling players, and low-intensity
 - `subscription_payer_flag`
 - `subscription_transaction_count`
 - `subscription_revenue_share`
+- `consumable_revenue_share`
 
-These distinguish non-payers, light payers, heavy payers, trial users, and subscription-oriented spenders.
+This is compact enough to stay interview-friendly while still separating premium users, subscription-led users, and high-engagement non-payers.
 
-### Ads / Offers
+### Ads / offers / push interactions
 
 - `ad_watched_count`
+- `ad_watched_last_30d`
 - `ad_watched_per_session`
 - `offer_shown_count`
+- `offer_shown_last_30d`
 - `offer_purchased_event_count`
 - `offer_purchase_event_rate`
+- `push_notification_click_count`
+- `push_notification_click_last_30d`
+- `push_clicks_per_session`
+- `subscription_cancel_count`
+- `social_share_count`
 
-These are compact and directly actionable for segmentation because they reflect ad tolerance and commercial responsiveness.
+These are the highest-value event features for practical actionability. They support monetization, CRM, and retention use cases without expanding raw event JSON.
 
-## 3. Transformations
+## Transformations and missing-value handling
 
-### Cleaning
-
-The feature builder follows the agreed cleaning policy:
+### Cleaning rules applied
 
 - negative-duration sessions are removed
 - exact duplicate transactions are removed
 - exact duplicate events are removed
-- missing `country`, `install_source`, and `device_os` values are standardized to `"Unknown"`
+- missing `country`, `install_source`, and `device_os` are standardized to `"Unknown"`
 - zero-revenue transactions are retained but not treated as positive spend
 
-### Skew Handling
+### Skew handling
 
-The following high-skew features receive `log1p` companion columns:
+`log1p_*` companion columns are created for the most skewed count, recency, and revenue features, including:
 
-- `games_installed_count`
-- `days_since_game_install`
-- `sessions_total`
-- `active_days`
-- `total_session_duration_hours`
-- `levels_completed_total`
-- `levels_failed_total`
-- `transaction_count`
-- `total_revenue_usd`
-- `ad_watched_count`
-- `offer_shown_count`
+- install counts and lifecycle recency
+- sessions and active days
+- playtime and progression totals
+- transaction counts and revenue
+- ads, offer exposure, and push clicks
 
-The raw business-readable variables are kept, and `log1p_*` versions are added for clustering stability.
+The raw variables remain in the parquet for stakeholder readability; the transformed versions are used in clustering where they improve stability.
 
-### Missing Values
+### Missing values
 
-The final parquet is intentionally null-free for model readiness.
+The final mart is null-free.
 
 Rules:
 
-- count features are filled with `0`
-- rate and share features with no denominator are set to `0`
-- `days_since_last_session` falls back to `days_since_game_install + 1` when no session exists
-- `days_since_last_purchase` falls back to `days_since_game_install + 1` when no transaction exists
+- count-style features are filled with `0`
+- ratio features with no valid denominator are set to `0`
+- `days_since_last_session` falls back to `days_since_first_install + 1` for users with no valid session
+- `days_since_last_purchase` falls back to `days_since_first_install + 1` for users with no transaction history
 
-This keeps missingness explicit through flags such as `payer_flag` and `trial_started_flag` rather than via arbitrary mean imputation.
+This keeps missingness explicit through business flags instead of opaque statistical imputation.
 
-### Leakage Control
+## Deliberate exclusions
 
-This is an unsupervised feature table, so there is no target leakage. Still, temporal leakage is controlled by computing every feature from observed data up to a single shared snapshot date defined as the latest available day across the cleaned tables. No future labels or post-snapshot information are used.
+- No expansion of `event_params` into a wide sparse table.
+- No unsupported per-game allocation of sessions, transactions, or events.
+- No one-hot explosion of geography or install metadata inside the clustering input.
+- No feature dump of dozens of overlapping quantiles or rolling windows.
 
-## 4. Exclusions
+## Output
 
-The feature set intentionally excludes several tempting additions.
-
-### Excluded raw event parameter expansion
-
-`event_params` is not flattened. It would create a sparse, brittle table and is unnecessary for a compact interview-ready segmentation mart.
-
-### Excluded broad event catalog counts
-
-Only ads and offer interaction events are kept from the event stream. Other events were omitted to keep the feature set focused and compact.
-
-### Excluded unsupported per-game behavior attribution
-
-No attempt is made to split sessions, revenue, or events by `game_id`, because the source tables do not contain that key. Any such split would be heuristic leakage of assumptions, not information from the data.
-
-### Excluded high-cardinality geography engineering
-
-Raw `country` is retained as context, but no region or one-hot expansion is built into this mart. That keeps the output compact and leaves encoding choices to downstream modeling.
-
-### Excluded redundant summary statistics
-
-The mart avoids multiple overlapping session-duration quantiles and product-mix variants. The goal is interpretability and segmentation usefulness, not maximum feature count.
-
-## 5. Output Summary
-
-The resulting artifact is:
+Final artifact:
 
 - `data/processed/user_features.parquet`
 
-It is a clean `(user_id, game_id)` feature table suitable for downstream scaling, encoding, and clustering.
+This mart is compact, user-level, and directly usable for the notebook, model comparison, and business profiling.

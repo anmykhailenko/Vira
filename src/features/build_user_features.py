@@ -1,15 +1,4 @@
-"""Build the segmentation feature mart at the ``(user_id, game_id)`` grain.
-
-Chosen grain: one row per observed ``(user_id, game_id)`` install from ``users.csv``.
-
-Reasoning:
-- The data audit confirmed that users can appear in multiple games, so ``user_id``
-  alone is not a safe segmentation entity for this project.
-- ``(user_id, game_id)`` is the natural install grain available in the users table.
-- Activity tables only expose ``user_id``. Because they do not contain ``game_id``,
-  behavioral features below are computed at the portfolio ``user_id`` level and then
-  attached to each observed user-game row without attempting unsupported attribution.
-"""
+"""Build a compact portfolio-level user feature mart for segmentation."""
 
 from __future__ import annotations
 
@@ -26,37 +15,42 @@ if __package__ is None or __package__ == "":
 from src.data.load_data import load_all_datasets
 from src.utils.config import PROCESSED_DATA_DIR, ensure_output_dirs
 
-FEATURE_GRAIN = ("user_id", "game_id")
+FEATURE_GRAIN = "user_id"
 ROLLING_WINDOW_DAYS = 30
 USER_FEATURES_PATH = PROCESSED_DATA_DIR / "user_features.parquet"
 
 SKEWED_FEATURES = [
     "games_installed_count",
-    "days_since_game_install",
+    "days_since_first_install",
+    "days_since_latest_install",
+    "days_since_last_session",
+    "days_since_last_purchase",
     "sessions_total",
     "active_days",
     "total_session_duration_hours",
     "levels_completed_total",
     "levels_failed_total",
     "transaction_count",
+    "purchase_active_days",
     "total_revenue_usd",
     "ad_watched_count",
     "offer_shown_count",
+    "push_notification_click_count",
 ]
 
 INTEGER_FEATURES = [
     "games_installed_count",
     "multi_game_user_flag",
-    "install_rank_for_user",
-    "is_first_game_install_flag",
-    "days_since_game_install",
-    "days_since_first_portfolio_install",
+    "days_since_first_install",
+    "days_since_latest_install",
+    "install_span_days",
     "days_since_last_session",
     "days_since_last_purchase",
     "rfm_recency_days",
     "rfm_frequency_sessions",
     "sessions_total",
     "active_days",
+    "active_days_last_30d",
     "sessions_last_30d",
     "sessions_prev_30d",
     "levels_completed_total",
@@ -64,14 +58,21 @@ INTEGER_FEATURES = [
     "payer_flag",
     "transaction_count",
     "positive_revenue_transaction_count",
+    "purchase_active_days",
     "trial_started_flag",
     "trial_transaction_count",
     "trial_converted_flag",
     "subscription_payer_flag",
     "subscription_transaction_count",
     "ad_watched_count",
+    "ad_watched_last_30d",
     "offer_shown_count",
+    "offer_shown_last_30d",
     "offer_purchased_event_count",
+    "push_notification_click_count",
+    "push_notification_click_last_30d",
+    "subscription_cancel_count",
+    "social_share_count",
 ]
 
 
@@ -132,6 +133,7 @@ def clean_transactions(transactions: pd.DataFrame) -> pd.DataFrame:
     ).copy()
     cleaned["positive_revenue_flag"] = cleaned["revenue_usd"] > 0
     cleaned["subscription_flag"] = cleaned["product_type"].str.startswith("subscription")
+    cleaned["consumable_flag"] = cleaned["product_type"].eq("iap_consumable")
     cleaned["trial_flag"] = cleaned["is_trial"].fillna(False).astype(bool)
     cleaned["transaction_day"] = _normalize_to_utc_day(cleaned["transaction_date"])
     return cleaned
@@ -145,37 +147,53 @@ def clean_events(events: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
-def build_user_game_base(users: pd.DataFrame, snapshot_day: pd.Timestamp) -> pd.DataFrame:
+def build_portfolio_user_base(users: pd.DataFrame, snapshot_day: pd.Timestamp) -> pd.DataFrame:
     users_clean = users.copy()
     users_clean["country"] = users_clean["country"].fillna("Unknown")
     users_clean["install_source"] = users_clean["install_source"].fillna("Unknown")
     users_clean["device_os"] = users_clean["device_os"].fillna("Unknown")
 
-    base = (
-        users_clean.sort_values(["user_id", "install_date", "game_id"])
-        .drop_duplicates(["user_id", "game_id"], keep="first")
-        .copy()
+    installs = users_clean.sort_values(["user_id", "install_date", "game_id"]).copy()
+    first_install = installs.drop_duplicates("user_id", keep="first")
+    install_rollup = installs.groupby("user_id", as_index=False).agg(
+        first_install_date=("install_date", "min"),
+        latest_install_date=("install_date", "max"),
+        games_installed_count=("game_id", "nunique"),
     )
 
-    user_rollup = (
-        base.groupby("user_id", as_index=False)
-        .agg(
-            first_portfolio_install_date=("install_date", "min"),
-            games_installed_count=("game_id", "nunique"),
-        )
+    base = first_install.merge(install_rollup, on="user_id", how="left", suffixes=("", "_rollup"))
+    base = base.rename(
+        columns={
+            "install_date": "primary_install_date",
+            "install_source": "primary_install_source",
+            "device_os": "primary_device_os",
+            "country": "primary_country",
+            "game_id": "primary_game_id",
+        }
     )
-
-    base = base.merge(user_rollup, on="user_id", how="left")
     base["multi_game_user_flag"] = (base["games_installed_count"] > 1).astype("int8")
-    base["install_rank_for_user"] = (
-        base.groupby("user_id")["install_date"].rank(method="dense").astype("Int64")
-    )
-    base["is_first_game_install_flag"] = (base["install_rank_for_user"] == 1).astype("int8")
-    base["days_since_game_install"] = _days_between(snapshot_day, base["install_date"])
-    base["days_since_first_portfolio_install"] = _days_between(
-        snapshot_day, base["first_portfolio_install_date"]
-    )
-    return base
+    base["days_since_first_install"] = _days_between(snapshot_day, base["first_install_date"])
+    base["days_since_latest_install"] = _days_between(snapshot_day, base["latest_install_date"])
+    base["install_span_days"] = (
+        base["latest_install_date"] - base["first_install_date"]
+    ).dt.days.astype("Int64")
+    return base[
+        [
+            "user_id",
+            "primary_game_id",
+            "primary_install_date",
+            "latest_install_date",
+            "first_install_date",
+            "primary_install_source",
+            "primary_device_os",
+            "primary_country",
+            "games_installed_count",
+            "multi_game_user_flag",
+            "days_since_first_install",
+            "days_since_latest_install",
+            "install_span_days",
+        ]
+    ]
 
 
 def build_session_features(sessions: pd.DataFrame, snapshot_day: pd.Timestamp) -> pd.DataFrame:
@@ -196,6 +214,7 @@ def build_session_features(sessions: pd.DataFrame, snapshot_day: pd.Timestamp) -
     )
 
     recent_activity = sessions.loc[recent_mask].groupby("user_id").agg(
+        active_days_last_30d=("session_day", "nunique"),
         sessions_last_30d=("session_id", "nunique"),
         session_duration_hours_last_30d=("session_duration_hours", "sum"),
     )
@@ -249,12 +268,14 @@ def build_transaction_features(transactions: pd.DataFrame, snapshot_day: pd.Time
     summary = transactions.groupby("user_id").agg(
         transaction_count=("transaction_date", "size"),
         positive_revenue_transaction_count=("positive_revenue_flag", "sum"),
+        purchase_active_days=("transaction_day", "nunique"),
         total_revenue_usd=("revenue_usd", "sum"),
         avg_revenue_per_transaction_usd=("revenue_usd", "mean"),
         last_purchase_day=("transaction_day", "max"),
         trial_transaction_count=("trial_flag", "sum"),
         subscription_transaction_count=("subscription_flag", "sum"),
         subscription_revenue_usd=("revenue_usd", lambda s: s[transactions.loc[s.index, "subscription_flag"]].sum()),
+        consumable_revenue_usd=("revenue_usd", lambda s: s[transactions.loc[s.index, "consumable_flag"]].sum()),
     )
 
     trial_conversion = (
@@ -272,12 +293,25 @@ def build_transaction_features(transactions: pd.DataFrame, snapshot_day: pd.Time
     features["subscription_revenue_share"] = _safe_divide(
         features["subscription_revenue_usd"], features["total_revenue_usd"]
     )
+    features["consumable_revenue_share"] = _safe_divide(
+        features["consumable_revenue_usd"], features["total_revenue_usd"]
+    )
     features["rfm_monetary_total_revenue_usd"] = features["total_revenue_usd"]
-    return features.drop(columns=["last_purchase_day", "subscription_revenue_usd"]).reset_index()
+    return features.drop(
+        columns=["last_purchase_day", "subscription_revenue_usd", "consumable_revenue_usd"]
+    ).reset_index()
 
 
-def build_event_features(events: pd.DataFrame) -> pd.DataFrame:
-    tracked_events = ["ad_watched", "offer_shown", "offer_purchased"]
+def build_event_features(events: pd.DataFrame, snapshot_day: pd.Timestamp) -> pd.DataFrame:
+    recent_window_start = snapshot_day - pd.Timedelta(days=ROLLING_WINDOW_DAYS)
+    tracked_events = [
+        "ad_watched",
+        "offer_shown",
+        "offer_purchased",
+        "push_notification_click",
+        "subscription_cancel",
+        "social_share",
+    ]
 
     event_counts = (
         events.loc[events["event_name"].isin(tracked_events)]
@@ -286,36 +320,78 @@ def build_event_features(events: pd.DataFrame) -> pd.DataFrame:
         .unstack(fill_value=0)
     )
 
+    recent_counts = (
+        events.loc[(events["event_name"].isin(tracked_events)) & (events["event_day"] >= recent_window_start)]
+        .groupby(["user_id", "event_name"])
+        .size()
+        .unstack(fill_value=0)
+    )
+
     for event_name in tracked_events:
         if event_name not in event_counts.columns:
             event_counts[event_name] = 0
+        if event_name not in recent_counts.columns:
+            recent_counts[event_name] = 0
 
-    return (
-        event_counts.rename(
-            columns={
-                "ad_watched": "ad_watched_count",
-                "offer_shown": "offer_shown_count",
-                "offer_purchased": "offer_purchased_event_count",
-            }
-        )
-        .reset_index()
-    )
+    features = event_counts.join(
+        recent_counts.add_suffix("_last_30d"),
+        how="outer",
+    ).fillna(0)
+
+    renamed = features.rename(
+        columns={
+            "ad_watched": "ad_watched_count",
+            "ad_watched_last_30d": "ad_watched_last_30d",
+            "offer_shown": "offer_shown_count",
+            "offer_shown_last_30d": "offer_shown_last_30d",
+            "offer_purchased": "offer_purchased_event_count",
+            "push_notification_click": "push_notification_click_count",
+            "push_notification_click_last_30d": "push_notification_click_last_30d",
+            "subscription_cancel": "subscription_cancel_count",
+            "social_share": "social_share_count",
+        }
+    ).reset_index()
+
+    for column in [
+        "ad_watched_count",
+        "ad_watched_last_30d",
+        "offer_shown_count",
+        "offer_shown_last_30d",
+        "offer_purchased_event_count",
+        "push_notification_click_count",
+        "push_notification_click_last_30d",
+        "subscription_cancel_count",
+        "social_share_count",
+    ]:
+        if column not in renamed.columns:
+            renamed[column] = 0
+
+    return renamed
 
 
 def apply_missing_value_strategy(features: pd.DataFrame) -> pd.DataFrame:
     result = features.copy()
 
-    key_columns = {"user_id", "game_id", "install_date", "first_portfolio_install_date"}
+    key_columns = {
+        "user_id",
+        "primary_game_id",
+        "primary_install_date",
+        "latest_install_date",
+        "first_install_date",
+        "primary_install_source",
+        "primary_device_os",
+        "primary_country",
+    }
     zero_fill_columns = [column for column in result.columns if column not in key_columns]
     result[zero_fill_columns] = result[zero_fill_columns].fillna(0)
 
     result["days_since_last_session"] = result["days_since_last_session"].where(
         result["sessions_total"] > 0,
-        result["days_since_game_install"] + 1,
+        result["days_since_first_install"] + 1,
     )
     result["days_since_last_purchase"] = result["days_since_last_purchase"].where(
         result["transaction_count"] > 0,
-        result["days_since_game_install"] + 1,
+        result["days_since_first_install"] + 1,
     )
 
     for column in INTEGER_FEATURES:
@@ -341,13 +417,13 @@ def build_user_feature_mart() -> pd.DataFrame:
 
     snapshot_day = _get_snapshot_day(users=users, sessions=sessions, transactions=transactions, events=events)
 
-    user_game_base = build_user_game_base(users=users, snapshot_day=snapshot_day)
+    base = build_portfolio_user_base(users=users, snapshot_day=snapshot_day)
     session_features = build_session_features(sessions=sessions, snapshot_day=snapshot_day)
     transaction_features = build_transaction_features(transactions=transactions, snapshot_day=snapshot_day)
-    event_features = build_event_features(events=events)
+    event_features = build_event_features(events=events, snapshot_day=snapshot_day)
 
     features = (
-        user_game_base.merge(session_features, on="user_id", how="left")
+        base.merge(session_features, on="user_id", how="left")
         .merge(transaction_features, on="user_id", how="left")
         .merge(event_features, on="user_id", how="left")
     )
@@ -357,21 +433,25 @@ def build_user_feature_mart() -> pd.DataFrame:
     features["offer_purchase_event_rate"] = _safe_divide(
         features["offer_purchased_event_count"], features["offer_shown_count"]
     )
+    features["push_clicks_per_session"] = _safe_divide(
+        features["push_notification_click_count"], features["sessions_total"]
+    )
     features = apply_robustness_transforms(features)
 
     ordered_columns = [
         "user_id",
-        "game_id",
-        "install_date",
-        "install_source",
-        "device_os",
-        "country",
+        "primary_game_id",
+        "primary_install_date",
+        "latest_install_date",
+        "first_install_date",
+        "primary_install_source",
+        "primary_device_os",
+        "primary_country",
         "games_installed_count",
         "multi_game_user_flag",
-        "install_rank_for_user",
-        "is_first_game_install_flag",
-        "days_since_game_install",
-        "days_since_first_portfolio_install",
+        "days_since_first_install",
+        "days_since_latest_install",
+        "install_span_days",
         "days_since_last_session",
         "days_since_last_purchase",
         "rfm_recency_days",
@@ -379,6 +459,7 @@ def build_user_feature_mart() -> pd.DataFrame:
         "rfm_monetary_total_revenue_usd",
         "sessions_total",
         "active_days",
+        "active_days_last_30d",
         "sessions_per_active_day",
         "total_session_duration_hours",
         "avg_session_duration_min",
@@ -397,6 +478,7 @@ def build_user_feature_mart() -> pd.DataFrame:
         "payer_flag",
         "transaction_count",
         "positive_revenue_transaction_count",
+        "purchase_active_days",
         "total_revenue_usd",
         "avg_revenue_per_transaction_usd",
         "trial_started_flag",
@@ -405,14 +487,22 @@ def build_user_feature_mart() -> pd.DataFrame:
         "subscription_payer_flag",
         "subscription_transaction_count",
         "subscription_revenue_share",
+        "consumable_revenue_share",
         "ad_watched_count",
+        "ad_watched_last_30d",
         "ad_watched_per_session",
         "offer_shown_count",
+        "offer_shown_last_30d",
         "offer_purchased_event_count",
         "offer_purchase_event_rate",
+        "push_notification_click_count",
+        "push_notification_click_last_30d",
+        "push_clicks_per_session",
+        "subscription_cancel_count",
+        "social_share_count",
     ] + [f"log1p_{column}" for column in SKEWED_FEATURES]
 
-    return features.loc[:, ordered_columns].sort_values(["user_id", "game_id"]).reset_index(drop=True)
+    return features.loc[:, ordered_columns].sort_values("user_id").reset_index(drop=True)
 
 
 def save_user_feature_mart(features: pd.DataFrame, output_path: Path = USER_FEATURES_PATH) -> Path:
@@ -423,7 +513,7 @@ def save_user_feature_mart(features: pd.DataFrame, output_path: Path = USER_FEAT
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build the user-game segmentation feature mart.")
+    parser = argparse.ArgumentParser(description="Build the portfolio user segmentation feature mart.")
     parser.add_argument(
         "--output-path",
         type=Path,

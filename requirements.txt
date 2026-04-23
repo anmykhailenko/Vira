@@ -1,9 +1,9 @@
 jupyter
+ipykernel
+matplotlib
+nbformat
 numpy
 pandas
-matplotlib
-seaborn
+pyarrow
 scikit-learn
 scipy
-nbformat
-ipykernel
